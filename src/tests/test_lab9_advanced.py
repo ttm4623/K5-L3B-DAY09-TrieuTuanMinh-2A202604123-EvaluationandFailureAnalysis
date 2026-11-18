@@ -32,8 +32,9 @@ def test_pass_k_rejects_bad_args(stats):
 
 
 def _report(rows, metrics, items=4, seeds=(1, 2)):
+    complete_rows = [{**row, "cost": row.get("cost", 0.0)} for row in rows]
     return {"manifest": {"eval_set_sha": "x", "items": items, "seeds": list(seeds)},
-            "rows": rows, "metrics": metrics, "evaluator_failures": []}
+            "rows": complete_rows, "metrics": metrics, "evaluator_failures": []}
 
 
 ROWS = [{"item_id": f"E-{i:03d}", "seed": s, "pass_rate": True, "slices": ["denial"] if i < 2 else []}
@@ -53,6 +54,48 @@ def test_integrity_flags_nan_and_dropped_rows():
     assert gate.integrity_check(dropped, base, SPEC)
 
 
+def test_integrity_flags_duplicate_rows_and_evaluator_failures():
+    from lab9 import gate
+
+    base = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    duplicated_rows = copy.deepcopy(ROWS)
+    duplicated_rows[-1] = copy.deepcopy(duplicated_rows[0])
+    duplicated = _report(duplicated_rows, {"pass_rate": 1.0})
+    failed_evaluator = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    failed_evaluator["evaluator_failures"] = ["E-001@1:grader raised"]
+
+    assert gate.integrity_check(duplicated, base, SPEC)
+    assert gate.integrity_check(failed_evaluator, base, SPEC)
+
+
+def test_integrity_flags_null_graded_metric_and_relabelled_slice():
+    from lab9 import gate
+
+    base = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    null_metric_rows = copy.deepcopy(ROWS)
+    null_metric_rows[0]["pass_rate"] = None
+    null_metric = _report(null_metric_rows, {"pass_rate": 1.0})
+    relabelled_rows = copy.deepcopy(ROWS)
+    for row in relabelled_rows:
+        if row["item_id"] == "E-000":
+            row["slices"] = []
+    relabelled = _report(relabelled_rows, {"pass_rate": 1.0})
+
+    assert gate.integrity_check(null_metric, base, SPEC)
+    assert gate.integrity_check(relabelled, base, SPEC)
+
+
+def test_integrity_flags_metric_aggregate_not_matching_rows():
+    from lab9 import gate
+
+    base = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    rows = copy.deepcopy(ROWS)
+    rows[0]["pass_rate"] = False
+    forged = _report(rows, {"pass_rate": 1.0})
+
+    assert gate.integrity_check(forged, base, SPEC)
+
+
 def test_integrity_flags_loosened_spec():
     from lab9 import gate
 
@@ -61,6 +104,22 @@ def test_integrity_flags_loosened_spec():
     loose["metrics"][0]["threshold"]["min"] = 0.5
     assert gate.integrity_check(base, base, loose, SPEC)
     assert gate.integrity_check(base, base, SPEC, SPEC) == []
+
+
+def test_integrity_flags_removed_metric_or_slice_guard():
+    from lab9 import gate
+
+    report = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    removed_metric = dict(SPEC, metrics=[])
+    assert gate.integrity_check(report, report, removed_metric, SPEC)
+
+    base_spec = dict(SPEC, slices=[
+        {"name": "denial", "metric": "pass_rate", "no_significant_drop": True, "blocking": True}
+    ])
+    loosened_slice = dict(SPEC, slices=[
+        {"name": "denial", "metric": "pass_rate", "blocking": True}
+    ])
+    assert gate.integrity_check(report, report, loosened_slice, base_spec)
 
 
 def test_slice_check_blocks_a_slice_below_floor():
@@ -74,3 +133,19 @@ def test_slice_check_blocks_a_slice_below_floor():
     spec = dict(SPEC, slices=[{"name": "denial", "metric": "pass_rate", "min": 0.9, "blocking": True}])
     blocked, _ = gate.slice_check(_report(rows, {"pass_rate": 0.75}), base, spec)
     assert blocked == ["slice:denial/pass_rate"]
+
+
+def test_slice_check_does_not_block_when_paired_ci_touches_zero():
+    from lab9 import gate
+
+    base = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    rows = copy.deepcopy(ROWS)
+    rows[0]["pass_rate"] = False
+    spec = dict(SPEC, bootstrap={"n_resamples": 1000, "rng": 2027},
+                slices=[{"name": "denial", "metric": "pass_rate",
+                         "no_significant_drop": True, "blocking": True}])
+
+    blocked, lines = gate.slice_check(_report(rows, {"pass_rate": 0.875}), base, spec)
+
+    assert blocked == []
+    assert "CI [-0.500, +0.000]" in lines[0]
